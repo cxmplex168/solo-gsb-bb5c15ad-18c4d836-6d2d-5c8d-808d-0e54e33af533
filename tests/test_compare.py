@@ -234,6 +234,118 @@ class TestCompareReports:
         assert result["summary_diff"]["total"]["delta"] == 0
 
 
+class TestCanonicalOrdering:
+    """配对与输出次序与报告内顺序无关（重复 issue 场景）。"""
+
+    def test_persisting_duplicates_swap_order_gives_same_response(self):
+        # 同指纹、同级别、不同 message/reason 的两条重复记录；仅交换
+        # 当前报告内的顺序，persisting 数组必须逐字一致（旧实现按 FIFO
+        # 配对且排序键只含四字段时会输出相反顺序）。
+        same = dict(path="#/properties/a", code="required_added", severity="error")
+        a = make_issue(message="消息A", reason="原因A", **same)
+        b = make_issue(message="消息B", reason="原因B", **same)
+
+        r1 = compare.compare_reports(make_report([dict(a), dict(b)]),
+                                     make_report([dict(a), dict(b)]))
+        r2 = compare.compare_reports(make_report([dict(b), dict(a)]),
+                                     make_report([dict(b), dict(a)]))
+        r3 = compare.compare_reports(make_report([dict(a), dict(b)]),
+                                     make_report([dict(b), dict(a)]))
+
+        assert r1["counts"]["persisting"] == 2
+        assert [i["message"] for i in r1["issues"]["persisting"]] == ["消息A", "消息B"]
+        assert r2 == r1
+        assert r3 == r1  # 两报告顺序均被打乱，结果仍一致
+
+    def test_full_result_invariant_under_any_permutation(self):
+        # 覆盖四类结果与两阶段配对的复合场景：打乱两份报告内 issue 的
+        # 任意排列，完整响应（除 baseline/current 概念外）必须完全一致。
+        same = dict(path="#/properties/p", code="type_removed", reason="r")
+        baseline = [
+            make_issue(message="e1", severity="error", **same),
+            make_issue(message="e2", severity="error", **same),
+            make_issue(message="w1", severity="warning", **same),
+            make_issue(path="#/properties/f", code="enum_added",
+                       severity="error", message="only-base", reason="rb"),
+        ]
+        current = [
+            make_issue(message="w2", severity="warning", **same),
+            make_issue(message="e3", severity="error", **same),
+            make_issue(message="w3", severity="warning", **same),
+            make_issue(message="w4", severity="warning", **same),
+            make_issue(path="#/properties/n", code="const_added",
+                       severity="error", message="only-cur", reason="rc"),
+        ]
+        expected = compare.compare_reports(make_report(baseline),
+                                           make_report(current))
+        # 级别桶计数：base error×2/warning×1，cur error×1/warning×3
+        # -> persisting=2（error、warning 各一），severity_changed=1
+        #    （error→warning），fixed=1，added=2
+        assert expected["counts"] == {"added": 2, "fixed": 1,
+                                      "persisting": 2, "severity_changed": 1}
+
+        perms_baseline = [
+            baseline,
+            list(reversed(baseline)),
+            [baseline[2], baseline[0], baseline[3], baseline[1]],
+        ]
+        perms_current = [
+            current,
+            list(reversed(current)),
+            [current[3], current[0], current[4], current[2], current[1]],
+        ]
+        for b in perms_baseline:
+            for c in perms_current:
+                assert compare.compare_reports(make_report(b), make_report(c)) == expected
+
+    def test_duplicate_records_are_kept_with_counts(self):
+        # 规范排序只定次序、不去重：完全相同的重复条目全部保留。
+        issue = make_issue(path="#/properties/q", code="required_added")
+        baseline = make_report([dict(issue), dict(issue), dict(issue)])
+        current = make_report([dict(issue)])
+        result = compare.compare_reports(baseline, current)
+        assert result["counts"] == {"added": 0, "fixed": 2, "persisting": 1,
+                                    "severity_changed": 0}
+        assert len(result["issues"]["fixed"]) == 2
+
+    def test_severity_changed_sorted_by_severity_pair_then_message(self):
+        # 同指纹的跨级别重复配对：级别组合相同时按 message 规范排序，
+        # 与两份报告内的出现顺序无关。
+        same = dict(path="#/properties/s", code="integer_required", reason="r")
+        baseline = [
+            make_issue(severity="error", message="b-high", **same),
+            make_issue(severity="error", message="b-low", **same),
+        ]
+        current = [
+            make_issue(severity="warning", message="c-zzz", **same),
+            make_issue(severity="warning", message="c-aaa", **same),
+        ]
+        r1 = compare.compare_reports(make_report(baseline), make_report(current))
+        r2 = compare.compare_reports(make_report(list(reversed(baseline))),
+                                     make_report(list(reversed(current))))
+        assert r1["counts"]["severity_changed"] == 2
+        messages = [(i["baseline_severity"], i["current_severity"], i["message"])
+                    for i in r1["issues"]["severity_changed"]]
+        assert messages == [
+            ("error", "warning", "c-aaa"),
+            ("error", "warning", "c-zzz"),
+        ]
+        assert r2 == r1
+
+    def test_added_and_fixed_ties_broken_deterministically(self):
+        # added / fixed 中同四字段的重复记录按 severity/message/reason 决胜，
+        # 交换报告内顺序输出不变。
+        dup = dict(path="#/properties/d", code="required_added", severity="error")
+        a = make_issue(message="a", reason="x", **dup)
+        b = make_issue(message="b", reason="y", **dup)
+        result = compare.compare_reports(make_report([dict(a), dict(b)]),
+                                         make_report([]))
+        assert [i["message"] for i in result["issues"]["fixed"]] == ["a", "b"]
+        result_rev = compare.compare_reports(make_report([dict(b), dict(a)]),
+                                             make_report([]))
+        assert [i["message"] for i in result_rev["issues"]["fixed"]] == ["a", "b"]
+
+
 class TestConditionalIssues:
     """条件分支 issue 的指纹与分类。"""
 
