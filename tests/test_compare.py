@@ -1,4 +1,6 @@
 """基线对比引擎（app.compare）单元测试。"""
+import itertools
+
 from app import compare
 
 
@@ -258,3 +260,178 @@ class TestConditionalIssues:
         assert changed["path"] == "#/then"
         assert changed["baseline_severity"] == "warning"
         assert changed["current_severity"] == "error"
+
+
+class TestCanonicalOrdering:
+    """重复 issue 的规范次序：配对与输出均与报告内出现顺序无关。"""
+
+    def test_duplicate_same_severity_pairs_canonically(self):
+        # 同一指纹 + 同一级别、仅 message 不同的重复记录（含完全重复项）：
+        # 桶内按规范次序 FIFO 配对，数量持平部分全部 persisting（重复条目
+        # 分别保留、不被合并），多出的记录按规范次序靠后者归入 fixed / added
+        baseline_issues = [
+            make_issue(message="m3"), make_issue(message="m1"),
+            make_issue(message="m2"), make_issue(message="m2"),
+        ]
+        current_issues = [
+            make_issue(message="m2"), make_issue(message="m1"),
+            make_issue(message="m2"),
+        ]
+        result = compare.compare_reports(
+            make_report(baseline_issues), make_report(current_issues))
+
+        assert result["counts"] == {"added": 0, "fixed": 1, "persisting": 3,
+                                    "severity_changed": 0}
+        assert [i["message"] for i in result["issues"]["persisting"]] == [
+            "m1", "m2", "m2"]
+        assert [i["message"] for i in result["issues"]["fixed"]] == ["m3"]
+
+        # 镜像：交换基线 / 当前，同一批多出的记录归入 added
+        result = compare.compare_reports(
+            make_report(current_issues), make_report(baseline_issues))
+        assert result["counts"] == {"added": 1, "fixed": 0, "persisting": 3,
+                                    "severity_changed": 0}
+        assert [i["message"] for i in result["issues"]["persisting"]] == [
+            "m1", "m2", "m2"]
+        assert [i["message"] for i in result["issues"]["added"]] == ["m3"]
+
+    def test_duplicates_output_independent_of_input_order(self):
+        # 任意交换两份报告内重复记录的顺序，四类数组（内容与顺序）必须
+        # 完全一致——这是本次修复的核心稳定性保证
+        baseline_issues = [
+            make_issue(severity="error", message="x1"),
+            make_issue(severity="error", message="x2"),
+            make_issue(severity="warning", message="x3"),
+            make_issue(code="other", severity="error", message="y1"),
+        ]
+        current_issues = [
+            make_issue(severity="warning", message="x5"),
+            make_issue(severity="error", message="x2"),
+            make_issue(severity="warning", message="x4"),
+            make_issue(code="third", severity="warning", message="z1"),
+        ]
+        baseline = make_report(baseline_issues)
+        current = make_report(current_issues)
+        expected = compare.compare_reports(baseline, current)
+
+        # 基线 error[x1,x2] + warning[x3]；当前 error[x2] + warning[x4,x5]
+        assert expected["counts"] == {"added": 1, "fixed": 1,
+                                      "persisting": 2, "severity_changed": 1}
+        persisting = expected["issues"]["persisting"]
+        assert [i["message"] for i in persisting] == ["x2", "x4"]
+        changed = expected["issues"]["severity_changed"]
+        assert [(i["baseline_severity"], i["current_severity"], i["message"])
+                for i in changed] == [("error", "warning", "x5")]
+        assert [i["message"] for i in expected["issues"]["fixed"]] == ["y1"]
+        assert [i["message"] for i in expected["issues"]["added"]] == ["z1"]
+
+        for b_perm in itertools.permutations(baseline_issues):
+            for c_perm in itertools.permutations(current_issues):
+                result = compare.compare_reports(
+                    make_report(list(b_perm)), make_report(list(c_perm)))
+                assert result == expected
+
+    def test_cross_severity_duplicates_pair_canonically(self):
+        # 基线 error×2、当前 warning×2，message 各不同：跨级别配对按
+        # 规范次序逐条对应，与报告内顺序无关，两条变化均保留
+        baseline_issues = [
+            make_issue(severity="error", message="m2"),
+            make_issue(severity="error", message="m1"),
+        ]
+        current_issues = [
+            make_issue(severity="warning", message="m4"),
+            make_issue(severity="warning", message="m3"),
+        ]
+        result = compare.compare_reports(
+            make_report(baseline_issues), make_report(current_issues))
+
+        assert result["counts"] == {"added": 0, "fixed": 0, "persisting": 0,
+                                    "severity_changed": 2}
+        changed = result["issues"]["severity_changed"]
+        assert [i["message"] for i in changed] == ["m3", "m4"]
+        assert [(i["baseline_severity"], i["current_severity"]) for i in changed] == [
+            ("error", "warning"), ("error", "warning")]
+
+        for b_perm in itertools.permutations(baseline_issues):
+            for c_perm in itertools.permutations(current_issues):
+                again = compare.compare_reports(
+                    make_report(list(b_perm)), make_report(list(c_perm)))
+                assert again == result
+
+    def test_severity_changed_sorted_by_severity_combination(self):
+        # 同一指纹剩余的跨级别记录按（基线级别, 当前级别）组合确定性排序：
+        # error->info 排在 warning->notice 之前，不受出现顺序影响
+        baseline_issues = [
+            make_issue(severity="warning", message="b2"),
+            make_issue(severity="error", message="b1"),
+        ]
+        current_issues = [
+            make_issue(severity="notice", message="c2"),
+            make_issue(severity="info", message="c1"),
+        ]
+        result = compare.compare_reports(
+            make_report(baseline_issues), make_report(current_issues))
+
+        changed = result["issues"]["severity_changed"]
+        assert [(i["baseline_severity"], i["current_severity"], i["message"])
+                for i in changed] == [
+                    ("error", "info", "c1"),
+                    ("warning", "notice", "c2"),
+                ]
+
+        for b_perm in itertools.permutations(baseline_issues):
+            for c_perm in itertools.permutations(current_issues):
+                again = compare.compare_reports(
+                    make_report(list(b_perm)), make_report(list(c_perm)))
+                assert again == result
+
+    def test_raw_reason_breaks_ties_within_bucket(self):
+        # 指纹相同（规范化 reason 一致）、级别相同，但原始 reason 不同的
+        # 重复记录：按原始 reason 的规范次序配对，与报告内顺序无关
+        r_tab = "\t原因一\t"      # 规范化后与 "原因一" 相同 -> 同一指纹
+        r_pad = "  原因一  "      # 同上；原始文本排序：\t < 空格 < 原
+        r_bare = "原因一"
+        baseline_issues = [
+            make_issue(reason=r_bare),
+            make_issue(reason=r_tab),
+            make_issue(reason=r_pad),
+        ]
+        current_issues = [
+            make_issue(reason=r_pad),
+            make_issue(reason=r_tab),
+        ]
+        expected = compare.compare_reports(
+            make_report(baseline_issues), make_report(current_issues))
+        assert [i["reason"] for i in expected["issues"]["persisting"]] == [
+            r_tab, r_pad]
+        assert [i["reason"] for i in expected["issues"]["fixed"]] == [r_bare]
+
+        # 镜像：交换基线 / 当前，多出的记录归入 added
+        mirror = compare.compare_reports(
+            make_report(current_issues), make_report(baseline_issues))
+        assert [i["reason"] for i in mirror["issues"]["added"]] == [r_bare]
+
+        for b_perm in itertools.permutations(baseline_issues):
+            for c_perm in itertools.permutations(current_issues):
+                result = compare.compare_reports(
+                    make_report(list(b_perm)), make_report(list(c_perm)))
+                assert result == expected
+
+    def test_self_compare_stable_for_shuffled_duplicates(self):
+        # 报告与自身比较：打乱顺序后 persisting 条目集合（多重集）不变，
+        # 全部配为 persisting 且重复条目完整保留
+        issues = [
+            make_issue(message="m2"),
+            make_issue(message="m1"),
+            make_issue(message="m2"),
+        ]
+        direct = compare.compare_reports(make_report(issues), make_report(issues))
+        for perm in itertools.permutations(issues):
+            shuffled = make_report(list(perm))
+            result = compare.compare_reports(shuffled, shuffled)
+            assert result["counts"] == direct["counts"]
+            assert [i["message"] for i in result["issues"]["persisting"]] == [
+                "m1", "m2", "m2"]
+            assert result["issues"]["added"] == []
+            assert result["issues"]["fixed"] == []
+            assert result["issues"]["severity_changed"] == []

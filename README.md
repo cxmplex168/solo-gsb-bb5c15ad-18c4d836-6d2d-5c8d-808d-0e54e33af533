@@ -618,6 +618,14 @@ curl -X POST http://localhost:8000/api/analyses/compare \
 | `persisting`      | 两份报告都存在且严重级别相同 —— 仍存在     |
 | `severity_changed`| 两份报告都存在但严重级别不同 —— 仅级别变化 |
 
+**输出与报告内 issue 顺序无关**：同一指纹、同一严重级别可能存在 message /
+原始 reason 不同的重复记录。配对前所有记录先按覆盖全部输出字段的规范键
+（direction、path、code、severity、message、reason）排序，再执行两阶段
+多重集配对（先配同级别为 `persisting`，再跨级别配为 `severity_changed`）；
+四类结果最终按确定性键排序（`severity_changed` 以基线 → 当前级别组合作为
+排序维度）。因此仅交换报告内记录顺序不会改变响应内容；重复条目全部保留、
+计数不去重。
+
 `compatibility` 给出两个兼容方向（backward / forward）在两次分析间的变化，
 `summary_diff` 给出错误 / 警告 / 总数（含分方向）的基线值、当前值与差值。
 

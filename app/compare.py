@@ -27,7 +27,13 @@
 **再**把双方剩余记录跨严重级别配为 ``severity_changed``；最后基线多出的
 归入 ``fixed``、当前多出的归入 ``added``。
 
-对比过程只读取两份报告，绝不修改原始分析记录。
+**输入顺序无关的规范次序**：同一指纹、同一严重级别可能存在 message / 原始
+reason 不同的重复记录，若按报告内出现顺序做桶内 FIFO 配对，仅交换报告内
+记录顺序就会让 persisting 等数组的内容与顺序发生变化。为此所有记录在配对
+前先按覆盖全部输出字段的规范键（direction、path、code、severity、message、
+reason）排序，桶内 FIFO 即变为规范 FIFO；四类结果最终再按扩展的确定性键
+排序（severity_changed 以基线/当前级别组合作为排序维度）。重复条目全部
+保留、计数不变，对比过程只读取两份报告，绝不修改原始分析记录。
 """
 from __future__ import annotations
 
@@ -83,12 +89,41 @@ def _issue_entry(issue: dict) -> dict:
     }
 
 
+def _canonical_issue_key(issue: dict) -> tuple:
+    """配对前的规范次序键（覆盖对比输出中会出现的全部字段）。
+
+    同一指纹 + 同一严重级别的重复记录可能仅在 message / 原始 reason 上
+    不同；桶内按此键排序后再做 FIFO，配对选择便只取决于记录内容，与
+    两份报告内的出现顺序无关。输出字段完全相同的记录视为等价。
+    """
+    return (
+        str(issue.get("direction") or ""),
+        str(issue.get("path") or ""),
+        str(issue.get("code") or ""),
+        str(issue.get("severity") or ""),
+        str(issue.get("message") or ""),
+        str(issue.get("reason") or ""),
+    )
+
+
 def _sort_key(entry: dict) -> tuple:
+    """四类结果的最终确定性排序键。
+
+    前四字段（direction / path / code / 指纹）确定业务身份；随后按级别
+    组合排序（added / fixed / persisting 两级均取自身 severity；
+    severity_changed 取基线 -> 当前级别组合）；最后用 message 与原始
+    reason 打破同指纹、同级别的重复条目并列，使重复条目也有稳定次序。
+    """
+    severity = str(entry.get("severity") or "")
     return (
         str(entry.get("direction") or ""),
         str(entry.get("path") or ""),
         str(entry.get("code") or ""),
         str(entry.get("fingerprint") or ""),
+        str(entry.get("baseline_severity") or severity),
+        str(entry.get("current_severity") or severity),
+        str(entry.get("message") or ""),
+        str(entry.get("reason") or ""),
     )
 
 
@@ -126,14 +161,17 @@ def _compatibility_diff(baseline_report: dict, current_report: dict) -> dict:
 
 def compare_reports(baseline_report: dict, current_report: dict) -> dict:
     """对比两份分析报告，返回问题分类与汇总差异（纯函数，不修改入参）。"""
-    # 每个指纹按严重级别分桶（保留报告中的出现顺序，桶内按多重集配对）
+    # 每个指纹按严重级别分桶；入桶前先按规范键排序，使桶内 FIFO 配对与
+    # 报告内出现顺序无关（保留重复记录，仅规范化其相对次序）
     baseline_groups: dict[str, dict[Any, deque]] = defaultdict(
         lambda: defaultdict(deque))
     current_groups: dict[str, dict[Any, deque]] = defaultdict(
         lambda: defaultdict(deque))
-    for issue in baseline_report.get("issues", []):
+    for issue in sorted(baseline_report.get("issues", []),
+                        key=_canonical_issue_key):
         baseline_groups[issue_fingerprint(issue)][issue.get("severity")].append(issue)
-    for issue in current_report.get("issues", []):
+    for issue in sorted(current_report.get("issues", []),
+                        key=_canonical_issue_key):
         current_groups[issue_fingerprint(issue)][issue.get("severity")].append(issue)
 
     added: list[dict] = []
@@ -141,7 +179,8 @@ def compare_reports(baseline_report: dict, current_report: dict) -> dict:
     persisting: list[dict] = []
     severity_changed: list[dict] = []
 
-    # 指纹与严重级别均排序遍历，保证配对选择与输出顺序稳定
+    # 指纹与严重级别均排序遍历，桶内记录已是规范次序，故配对选择与
+    # 输出顺序均与报告内出现顺序无关
     for fingerprint in sorted(set(baseline_groups) | set(current_groups)):
         baseline_by_sev = baseline_groups.get(fingerprint, {})
         current_by_sev = current_groups.get(fingerprint, {})
@@ -159,7 +198,8 @@ def compare_reports(baseline_report: dict, current_report: dict) -> dict:
                 persisting.append(_issue_entry(same_current.popleft()))
 
         # 阶段二：双方剩余记录严重级别集合必然不相交（相同级别的桶至少
-        # 有一方已在阶段一清空），跨严重级别逐条配为 severity_changed
+        # 有一方已在阶段一清空），按严重级别排序逐桶、桶内按规范次序
+        # 逐条跨级别配为 severity_changed
         leftover_base = [baseline_by_sev[sev] for sev in severities
                          if baseline_by_sev.get(sev)]
         leftover_current = [current_by_sev[sev] for sev in severities
